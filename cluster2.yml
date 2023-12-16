@@ -1,0 +1,282 @@
+- name: Install and Configure ArgoCD
+  hosts: gcp-5gcoe3
+  become: yes # Use sudo to run commands as root
+  tasks:
+
+  - name: Run update script
+    shell: |
+      #!/bin/bash
+      sudo apt-get update
+      ansible-galaxy collection install geerlingguy.argocd
+      sudo apt-get install -y python3-pip  # Added '-y' to automatically accept installation
+      pip3 install kubernetes
+      kubectl create namespace argocd
+      kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+      kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "NodePort"}}'
+      kubectl get svc -n argocd
+    register: update_result
+    changed_when: "'0 upgraded' not in update_result.stdout"
+
+  - name: Wait for the argocd-initial-admin-secret to be ready
+    shell: kubectl -n argocd wait --for=condition=ready pod -l app.kubernetes.io/name=argocd-server --timeout=300s
+    register: wait_result
+    until: wait_result.rc == 0
+    retries: 5
+    delay: 10
+    changed_when: false # Mark this task as not changed, as it doesn't affect the playbook state
+
+  - name: Get the password of ARGOCD GUI
+    shell: |
+      #!/bin/bash
+      kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+    register: argocd_password
+    when: wait_result.rc == 0 # Only execute when the wait was successful
+
+  - name: Display update output
+    debug:
+      var: update_result.stdout_lines
+
+  - name: Display ARGOCD Password
+    debug:
+      var: argocd_password.stdout
+
+  - name: Install ArgoCD CLI
+    shell: |
+      #!/bin/bash
+      curl -sSL -o argocd-linux-amd64 https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+      sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+    become: yes
+
+- name: Extract Port Number from kubectl output
+  hosts: gcp-5gcoe3
+  gather_facts: no
+  tasks:
+  - name: Run kubectl command
+    shell: kubectl get svc -n argocd
+
+    register: kubectl_output
+    changed_when: false # Mark this task as not changed, as it's just gathering information
+
+  - name: Extract the port number
+
+    set_fact:
+      argocd_port: "{{ (kubectl_output.stdout_lines | select('match', '^argocd-server\\s+NodePort')) | map('regex_replace', '.*80:(\\d+)/TCP.*', '\\1') | first }}"
+    when: kubectl_output.stdout_lines is defined and kubectl_output.stdout_lines | select('match', '^argocd-server\\s+NodePort') | list | count > 0
+
+  - name: Display the extracted port number
+    debug:
+      var: argocd_port
+
+  - name: Get the port number
+
+    set_fact:
+      argocd_ip_with_port: "172.30.110.170:{{ argocd_port }}"
+    when: argocd_port is defined
+
+  - name: Log in to ArgoCD CLI
+    set_fact:
+      argocd_login_command: "argocd login {{ argocd_ip_with_port }} --insecure --username=admin --password='{{ argocd_password.stdout }}'"
+    when: argocd_port is defined
+
+- name: Create ArgoCD Application
+  hosts: gcp-5gcoe3
+  gather_facts: no
+  tasks:
+  - name: Run ArgoCD login command
+    shell: "{{ argocd_login_command }}"
+    register: argocd_login_result
+    changed_when: false
+
+  - name: Create Kubernetes Secret for Git Credentials
+    shell: |
+      kubectl get secret argocd-repo-secret -n argocd || \
+        kubectl create secret generic argocd-repo-secret \
+          --from-literal=username=neha.mishra2@globallogic.com \
+          --from-literal=password=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 \
+          --type=kubernetes.io/basic-auth \
+          -n argocd
+    when: argocd_login_result.rc == 0
+
+  - name: Create ArgoCD Application
+
+    shell: |
+      argocd app create my-oai-application \
+        --repo https://github.com/nehamishra2globallogic/oaicorebasic.git \
+        --path charts/oai-5g-core/oai-5g-basic \
+        --dest-namespace argocd \
+        --dest-server https://kubernetes.default.svc \
+        --sync-policy automated \
+        --auto-prune
+      argocd app patch my-oai-application \
+        --patch '{"spec": {"source": {"repoURL": "https://github.com/nehamishra2globallogic/oaicorebasic.git", "targetRevision": "HEAD"}, "upsert": {"secretName": "argocd-repo-secret"}}}'
+      argocd app sync my-oai-application
+    when: argocd_login_result.rc == 0
+
+- name: Install Docker
+  hosts: gcp-5gcoe3 # Replace with the appropriate host or group
+  become: yes # Run tasks with sudo privileges
+
+  tasks:
+  - name: Update apt package cache
+    apt:
+      update_cache: yes
+
+  - name: Install dependencies
+    apt:
+      name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+
+  - name: Clean up existing Docker GPG key file
+    become: yes
+    file:
+      path: /usr/share/keyrings/docker-archive-keyring.gpg
+      state: absent
+
+  - name: Download Docker GPG key
+
+    become: yes
+    shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker-archive-keyring.gpg
+
+  - name: Import Docker GPG key
+    become: yes
+    shell: gpg --dearmor --batch -o /usr/share/keyrings/docker-archive-keyring.gpg /tmp/docker-archive-keyring.gpg
+
+  - name: Set up Docker stable repository
+    become: yes
+    shell: echo "deb [signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+  - name: Set up Docker stable repository
+
+
+    shell: echo "deb [signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+  - name: Update apt package cache (again with Docker repository)
+    apt:
+      update_cache: yes
+
+  - name: Install Docker
+    apt:
+      name: docker-ce
+      state: present
+
+  - name: Ensure Docker service is started
+    service:
+      name: docker
+      state: started
+
+- name: Setup Prometheus and Grafana
+  hosts: gcp-5gcoe3
+  gather_facts: false
+  become: yes
+  tasks:
+  - name: Install docker Python module
+    pip:
+      name: docker
+      executable: /usr/bin/pip3 # Adjust this path based on your Python version
+    become: yes
+
+  - name: Pull Docker images
+    docker_image:
+      name: "{{ item }}"
+      source: pull
+    with_items:
+    - grafana/grafana
+    - prom/prometheus
+    - bitnami/node-exporter
+
+  - name: Run Grafana container
+    docker_container:
+      name: grafana
+      image: grafana/grafana
+      ports:
+      - "3001:3000"
+      state: started
+    become: yes
+
+  - name: Check Grafana port
+    shell: "netstat -anpl | grep -i 3001"
+
+  - name: Create Prometheus configuration file directory
+    file:
+      path: /etc/prometheus
+      state: directory
+    become: yes
+
+  - name: Create Prometheus configuration file
+    copy:
+      content: |
+        global:
+          scrape_interval: 10s
+
+        scrape_configs:
+          - job_name: 'node'
+            scrape_interval: 5s
+            static_configs:
+              - targets: ['172.30.110.170:9100']
+      dest: /etc/prometheus/prometheus.yml
+    become: yes
+  - name: Create Prometheus data directory
+    file:
+      path: /tmp/prometheus-data
+      state: directory
+      mode: "0777"
+
+  - name: Adjust Prometheus directory permissions
+
+
+    file:
+      path: /etc/prometheus
+      state: directory
+      mode: "0755"
+    become: yes
+
+  - name: Adjust Prometheus configuration file permissions
+    file:
+      path: /etc/prometheus/prometheus.yml
+      state: file
+      mode: "0644" # Adjust permissions as needed
+    become: yes
+
+  - name: Run Prometheus container
+    docker_container:
+      name: prometheus
+      image: prom/prometheus
+      ports:
+      - "9091:9090"
+      volumes:
+      - /etc/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - /tmp/prometheus-data:/prometheus
+      detach: true
+    register: prometheus_result
+
+  - name: Check Prometheus container status
+    docker_container_info:
+      name: prometheus
+    register: prometheus_info
+    ignore_errors: yes
+
+  - name: Fail if Prometheus container is not running
+    fail:
+      msg: "Prometheus container failed to start. Check the logs for details."
+    when: "'State' in prometheus_info and 'Status' in prometheus_info.State and 'exited' in prometheus_info.State.Status"
+
+  - name: Debug Prometheus container info
+    debug:
+      var: prometheus_info
+
+  - name: Run Node Exporter container
+
+    docker_container:
+      name: node-exporter
+      image: bitnami/node-exporter
+      ports:
+      - "9100:9100"
+      state: started
+
+  - name: Check Node Exporter port
+
+    shell: "netstat -anpl | grep -i 9100"

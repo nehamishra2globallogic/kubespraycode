@@ -1,0 +1,15 @@
+[all]
+gcp-5gcoe3 ansible_host=172.30.110.170
+
+[kube-master]
+gcp-5gcoe3 ansible_host=172.30.110.170
+
+[etcd]
+gcp-5gcoe3 ansible_host=172.30.110.170
+
+[kube-node]
+gcp-5gcoe3 ansible_host=172.30.110.170
+
+[k8s-cluster:children]
+kube-master
+kube-node
